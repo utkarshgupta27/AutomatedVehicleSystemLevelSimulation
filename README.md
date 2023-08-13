@@ -12,7 +12,7 @@ Environment Simulation:
 Use simulation environments like CARLA, SUMO, or AirSim to emulate real-world conditions like traffic and weather.
 
 Integrate environmental simulations with vehicle dynamics for holistic testing.
-![simulation_GIF](.output.gif)
+![simulation_GIF](./output.gif)
 
 2. Body Control Simulator
 Responsible for components that interact directly with the vehicle's occupants, such as lights, infotainment systems, and window controls.
