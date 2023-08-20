@@ -1,185 +1,246 @@
 import pygame
-from pygame.locals import *
 import numpy as np
-import os
 from scipy.integrate import odeint
-from car_model import Car
+from constants import *
+from vehicle_params import vehicle_parameters
 from Road import Road
 
 # Constants
 WIDTH = 800
 HEIGHT = 600
 WHITE = (255, 255, 255)
-assets_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+RHO = 1.225  # air density in kg/m^3
+G = 9.81
+F_BRAKE_MAX = 1000  # Maximum brake force
+FPS=30
+dt = 0.05  # Time step for simulation
+engine_torque = 320
+slip_angle = 0.05
+
+class CarState:
+    def __init__(self, position=0, velocity=0, lateral_position=0, lateral_velocity=0, orientation=0) -> None:
+        self.position = position
+        self.velocity = velocity
+        self.lateral_position = lateral_position
+        self.lateral_velocity = lateral_velocity
+        self.orientation = orientation #heading
+        # self.steering_angle= #front wheel
+    def as_list(self):
+        return [self.position,self.velocity,self.lateral_position,self.lateral_velocity, self.orientation]
+
+class Car:
+    def __init__(self):
+        self.mass = vehicle_parameters["mass"]
+        self.drag_coefficient = vehicle_parameters["drag_coefficient"]
+        self.max_steering_angle = np.pi / 6
+        self.max_acceptable_acceleration = 50.0
+        self._throttle = 1
+        self._brake = 0
+        self._steering_angle = 0
+    @property
+    def throttle(self):
+        return self._throttle
+    @throttle.setter
+    def throttle(self, value):
+        self._throttle = max(0, min(1, value))
+        print("Debug_set_throttle: ",self._throttle)
+    @property
+    def brake(self):
+        return self._brake
+    @brake.setter
+    def brake(self, value):
+        self._brake = max(0, min(1, value))
+        print("Debug_set_brake: ",self._brake)
+    @property
+    def steering_angle(self):
+        return self._steering_angle
+    @steering_angle.setter
+    def steering_angle(self,value):
+        self._steering_angle = max(-self.max_steering_angle,min(value,self.max_steering_angle))
+    def traction_control(self, acceleration, engine_torque):
+        if acceleration > self.max_acceptable_acceleration:
+            return engine_torque * self.max_acceptable_acceleration / acceleration
+        return engine_torque
+
+    def longitudinal_dynamics(self, v, engine_torque):
+        F_drag = 0.5 * RHO * vehicle_parameters["frontal_area"] * self.drag_coefficient * v ** 2
+        F_rolling = self.mass * G * 0.015
+
+        F_net_without_engine_brake = -F_drag - F_rolling
+        a = F_net_without_engine_brake / self.mass
+
+        engine_max_torque = self.traction_control(a, engine_torque)
+        F_engine_max = engine_max_torque / vehicle_parameters["tire_radius"]
+        F_engine = self._throttle * F_engine_max
+        F_brake = self._brake * F_BRAKE_MAX
+
+        F_net = F_engine + F_net_without_engine_brake - F_brake
+
+        a = F_net / self.mass
+        print("Debug_long_dynamics brake,F_brake,throttle,F_engine,F_net:",self.brake,"\t",F_brake,"\t",self.throttle,"\t",F_engine,"\t",F_net)
+        return a
+
+    def lateral_dynamics(self, v_y, slip_angle):
+        F_cornering = -vehicle_parameters["tire_cornering_stiffness"] * slip_angle
+        a_y = F_cornering / self.mass
+        return a_y
+
+    def equations_of_motion(self, state, t, engine_torque, steering_angle, slip_angle):
+        position, velocity, lateral_position, lateral_velocity, orientation = state
+        slip_angle = np.arctan2(lateral_velocity, velocity)
+        adjust_slip_angle = slip_angle + steering_angle
+
+        acceleration = self.longitudinal_dynamics(velocity, engine_torque)
+        lateral_acceleration = self.lateral_dynamics(lateral_velocity, adjust_slip_angle)
+
+        dv_dt = acceleration
+        dv_y_dt = lateral_acceleration
+        dx_dt = velocity * np.cos(orientation)
+        dy_dt = velocity * np.sin(orientation)
+        dtheta_dt = velocity  * np.sin(steering_angle) / vehicle_parameters["wheelbase"]
+        print("debug_equation_of_motion, dtheta_dt:",dtheta_dt)
+        return [dx_dt, dv_dt, dy_dt, dv_y_dt, dtheta_dt]
+
+    def get_next_state(self, state: CarState, Dt, engine_torque, slip_angle, steering_angle) -> CarState:
+        # Integrate equations of motion over dt to get the next state
+        t = [0, Dt]
+        current_state_list=state.as_list()
+        next_state_values = odeint(self.equations_of_motion, current_state_list, t, args=(engine_torque, steering_angle, slip_angle))[1]
+        return CarState(*next_state_values)
+
 
 class Simulation:
     def __init__(self):
         pygame.init()
+        self.setup_display()
+        self.car_image = pygame.image.load("car.png")
+        self.car = Car()
+        self.exit = False
+        self.road = Road()
+        self.positions, self.lateral_positions, self.orientations, self.velocities = [],[],[],[]
+        self.current_state=CarState()
+
+    def setup_display(self):
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.HWSURFACE | pygame.DOUBLEBUF | pygame.RESIZABLE)
         pygame.display.set_caption("Car Animation")
-
         self.clock = pygame.time.Clock()
-        self.exit = False
-
-        self.load_assets()
-        self.car = Car()
-        self.road = Road()
-        self.initial_state = [0, 100, HEIGHT // 2, 0, 0]  # [position, velocity, lateral_position, lateral_velocity]
-
-        self.steering_angle=0
-        self.gear_state ='auto'  # can be 'auto', 'park', or 'manual'
-
-    def load_assets(self):
-        self.background_image = pygame.image.load(os.path.join(assets_path, "city", "background.png"))
-        self.FourwayCrossing_image = pygame.image.load(os.path.join(assets_path, "city", "4Wayroad800x600.png"))
-        self.car_image = pygame.image.load(os.path.join(assets_path, "car.png"))
-
-    def apply_gear_behavior(self, throttle, steering_angle):
-        if self.gear_state == 'auto':
-            return throttle, steering_angle
-        elif self.gear_state == 'park':
-            return 0, 0  # No throttle, no steering when in parking gear
-        elif self.gear_state == 'manual':
-            return throttle, steering_angle  # Allow both throttle and steering in manual mode
-        else:
-            raise ValueError(f"Unknown gear state: {self.gear_state}")
-
-
-    def control(self):
-        # Get road properties and key controls
-        lane_center, _ = self.draw_road()
-        throttle_auto,steering_angle_auto  = self.control_car(lane_center) if self.gear_state =="auto" else (0,0)
-        throttle_key, steering_angle_key  = self.control_with_keys()
-
-        # Use automatic steering angle when in auto mode, otherwise use manual/key input
-        throttle = throttle_auto if self.gear_state =="auto" else throttle_key
-        steering_angle = steering_angle_auto if self.gear_state =="auto" else self.steering_angle
-        
-        throttle, steering_angle = self.apply_gear_behavior(throttle, self.steering_angle)
-
-        if throttle_key:
-            throttle = throttle_key
-        if steering_angle_key is not None:
-            self.steering_angle = steering_angle_key 
-
-        return throttle
-
-    def control_with_keys(self):
-        keys = pygame.key.get_pressed()
-        throttle = 320
-        steering_changed=False
-        if keys[K_UP]:
-            throttle += 50
-        elif keys[K_DOWN]:
-            throttle -= 50
-
-        if keys[K_RIGHT]:
-            self.steering_angle += 10 * (np.pi / 180) #radians
-            steering_changed=True
-        elif keys[K_LEFT]:
-            self.steering_angle -= 10 * (np.pi / 180)
-            steering_changed=True
-        
-        if keys[K_a]:
-            self.gear_state = 'auto'
-        elif keys[K_p]:
-            self.gear_state = 'park'
-        elif keys[K_m]:
-            self.gear_state = 'manual'
-        print(f"Throttle: {throttle}")
-
-
-        # Return None for the steering angle if no change was made
-        return throttle, self.steering_angle if steering_changed else None
-        
-    def control_car(self, lane_center):
-        if self.gear_state!='auto':
-            return 0,0 # No throttle, steering
-        error_x = WIDTH // 2 - lane_center[0]
-        steering_angle = 0.05 * error_x
-        throttle = 320
-        return throttle, steering_angle
-
-    def rotated_car(self, steering_angle):
-        car_scaled = pygame.transform.scale(self.car_image, (44, 22))
-        return pygame.transform.rotate(car_scaled, -np.degrees(steering_angle))
-
-    def update_car_state(self, current_state, throttle, steering_angle,delta_t):
-        t = np.linspace(0, delta_t, 2)
-        new_state = odeint(self.car.equations_of_motion, current_state[:5], t, args=(throttle, 0, steering_angle, 0.05))
-        return new_state[-1]
-
-    def draw_car(self, state, rotated_img,orientation):
-        
-        # x_pos = lane_center[0] - rotated_img.get_width() / 2
-        # y_pos = lane_center[1] - rotated_img.get_height() / 2
-        x_pos = state[0]+ np.cos(orientation) * 5
-        y_pos =  state[2]- np.sin(orientation)* 5
-        x_pos_center=x_pos- rotated_img.get_width() / 2
-        y_pos_center=y_pos -  rotated_img.get_height()/2
-        self.screen.blit(rotated_img, (x_pos_center, y_pos_center))
-        print(f"x_pos: {x_pos_center},y_pos: {y_pos_center}")
-
-    def draw_road(self):
-        if self.FourwayCrossing_image.get_size() != (WIDTH, HEIGHT):
-            self.FourwayCrossing_image = pygame.transform.scale(self.FourwayCrossing_image, (WIDTH, HEIGHT))
-        # Get road properties based on car position
-        # properties = self.road.get_road_properties(int(self.position_pixels[i]))    
-        lines, com_img = self.road.detect_lanes_pygame(self.FourwayCrossing_image)
-        lane_center, _ = self.road.calculate_lane_center_and_slope(lines)
-        com_img_swapped = com_img.swapaxes(0, 1)
-        com_surface = pygame.surfarray.make_surface(com_img_swapped)
-        # print(f"Lane Center: {lane_center}")
-        return lane_center, com_surface
-
-    def handle_events(self):
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.exit = True
 
     def display_text(self, message, x, y, color=(0, 0, 0)):
         font = pygame.font.SysFont(None, 25)
         text = font.render(message, True, color)
         self.screen.blit(text, (x, y))
 
-    def update_display(self, position, velocity, steering_angle):
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.exit = True
+        self._handle_continuous_keys()
 
-        self.display_text(f"Steering Angle: {np.degrees(steering_angle)}", 10, 10)
-        self.display_text(f"Position_x: {position[0]:.2f}, Pos_x:{position[1]:.2f}", 10, 30)
-        self.display_text(f"Velocity_x: {velocity[0]:.2f},Velocity_y: {velocity[1]:.2f}", 10, 50)
-        self.display_text(f"Gear Mode: {self.gear_state.upper()}", 10, 70)
+    def _handle_continuous_keys(self):
+        keys = pygame.key.get_pressed()
+        
+        # Define a factor for steering angle change
+        steering_factor = 0.025 * self.car.max_steering_angle
 
-        pygame.display.flip()
+        if keys[pygame.K_UP]:
+            self.car.throttle = min(self.car.throttle + 0.1, 1)  # limit throttle to 1
+            if self.car.brake > 0:
+                self.car.brake = max(self.car.brake - 0.1, 0)        
+        if keys[pygame.K_DOWN]:
+            self.car.brake = min(self.car.brake + 0.1, 1)  # limit brake to 1
+            if self.car.throttle > 0:
+                self.car.throttle = max(self.car.throttle - 0.1, 0)
 
-    def run_simulation(self):
-        self.screen.fill(WHITE)
+        if keys[pygame.K_LEFT]:
+            self.car.steering_angle -= steering_factor
+        if keys[pygame.K_RIGHT]:
+            self.car.steering_angle += steering_factor
+        if keys[pygame.K_SPACE]:
+            self.car.throttle = 0
+            self.car.brake = 0
+            self.car.steering_angle = 0  # Reset the steering when spacebar is pressed
 
-        positions_over_time = [(self.initial_state[0],self.initial_state[2])]
-        velocities_over_time = [(self.initial_state[1],self.initial_state[3])]
-        orientations_over_time=[self.initial_state[4]]
-        lane_center, _ = self.draw_road()
+        # Print debug info
+        print("Debug_steering_angle: ", self.car.steering_angle)
+        print("Debug_max_steering_angle: ", self.car.max_steering_angle)
+        print("Debug_min_steering_angle: ", -self.car.max_steering_angle)
+
+    def update_dynamics(self, DT):
+        self.current_state = self.car.get_next_state(self.current_state, DT, engine_torque, slip_angle, self.car.steering_angle)
+        self.positions = np.append(self.positions, self.current_state.position)
+        self.velocities = np.append(self.velocities, self.current_state.velocity)
+        self.lateral_positions = np.append(self.lateral_positions, self.current_state.lateral_position)
+        self.orientations= np.append(self.orientations,self.current_state.orientation)
+
+    def rotated_car(self, orientation):
+        car_scaled = pygame.transform.scale(self.car_image, (44, 22))
+        rotated = pygame.transform.rotate(car_scaled, -np.degrees(orientation))
+        return rotated if rotated.get_width() != 0 and rotated.get_height() != 0 else car_scaled
+
+    def draw_car(self, x_pos, y_pos, rotated_img, orientation):
+        car_width, car_height = rotated_img.get_size()
+        # x_pos += np.cos(orientation) * 5
+        # y_pos -= np.sin(orientation) * 5
+        self.screen.blit(rotated_img, (WIDTH / 2 + x_pos - car_width / 2, HEIGHT / 2 + y_pos - car_height / 2))
+
+    def draw_road(self, i):
+        properties = self.road.get_road_properties(int(self.positions[i]))
+        self.screen.fill(colors["greenery"])
+        pygame.draw.rect(self.screen, colors[properties["road_type"]], (0, HEIGHT // 3, WIDTH, HEIGHT // 3))
+    def calculate_distance(self, x1, y1, x2, y2):
+        return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+    def calculate_acceleration(self, velocities, i):
+        if i == 0:
+            return 0
+        return (velocities[i] - velocities[i-1]) / 0.02  # dt = 1/50 = 0.02
+    
+    def run(self):
+        positions_over_time = []
+        lateral_positions_over_time = []
+        velocities_over_time = []
+        accelerations_over_time=[]
+        positions_over_time.append(self.current_state.position)
+        lateral_positions_over_time.append(self.current_state.lateral_position)
+        velocities_over_time.append(self.current_state.velocity)
+        accelerations_over_time.append(0)
+        i = 0
+        pygame.key.set_repeat(100, 50)  # Delay of 100ms before key repeats, then every 50ms
 
         while not self.exit:
+            # dt = self.clock.tick(FPS) / 1000.0  # Get time taken for the frame in seconds
             self.handle_events()
+            self.update_dynamics(dt)
+            # self.render(0)
+            self.screen.fill((0, 0, 0))
 
-            throttle = self.control()
-            delta_t = self.clock.tick(50)/1000.0 # seconds
-            new_state = self.update_car_state(self.initial_state, throttle, self.steering_angle, delta_t)
-            self.initial_state = new_state
-            positions_over_time.append((new_state[0],new_state[2]))
-            velocities_over_time.append((new_state[1],new_state[3]))
-            orientations_over_time.append(new_state[4])
-            lane_center, com_surface = self.draw_road()
-            self.screen.blit(com_surface, (0, 0))  # blitting the processed road image
-            if self.gear_state == "auto":
-                self.initial_state[2]=lane_center[0]
-            self.draw_car(self.initial_state, self.rotated_car(self.steering_angle),new_state[4])
-            self.update_display(positions_over_time[-1], velocities_over_time[-1], self.steering_angle)
+            self.draw_road(i)
 
-            self.clock.tick(50)
-        
-        pygame.quit()
+            positions_over_time.append(self.current_state.position)
+            lateral_positions_over_time.append(self.current_state.lateral_position)
+            velocities_over_time.append(self.current_state.velocity)
+            acc = self.calculate_acceleration(velocities_over_time, i)
+            accelerations_over_time.append(acc)
+            
+            pos_text = "Position_x: {:.2f}, Position_y: {:.2f}".format(self.current_state.position,self.current_state.lateral_position)
+            vel_text = "Velocity: {:.2f}".format(self.current_state.velocity)
+            acc_text ="Acceleration: {:.2f}".format(acc)
+
+            self.display_text(pos_text, 10, 30)
+            self.display_text(vel_text, 10, 50)
+            self.display_text(acc_text,10,70)
+
+            car_rotated_image = self.rotated_car(self.orientations[i])
+            self.draw_car(self.positions[i], self.lateral_positions[i], car_rotated_image, self.orientations[i])
+
+            pygame.display.flip()
+            i += 1
+            if i >= len(self.positions):
+                i = 0
+            self.clock.tick(FPS)
+
 
 if __name__ == "__main__":
     sim = Simulation()
-    sim.run_simulation()
+    sim.run()
+    pygame.quit()
